@@ -1,0 +1,278 @@
+name: MLOps CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  release:
+    types: [created]
+
+env:
+  PYTHON_VERSION: '3.9'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: Test Pipeline
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        pip install -r requirements.txt
+    
+    - name: Run tests
+      run: |
+        python -m pytest tests/ -v --tb=short
+    
+    - name: Test data preparation
+      run: |
+        python prepare_expanded_data.py
+        python -c "
+        import torch
+        data = torch.load('data/processed/train.pt')
+        assert len(data['data']) == 40, f'Expected 40 samples, got {len(data[\"data\"])}'
+        print('✓ Data preparation test passed')
+        "
+
+  train-and-export:
+    runs-on: ubuntu-latest
+    name: Train Model and Export ONNX
+    needs: test
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        pip install -r requirements.txt
+    
+    - name: Prepare data
+      run: |
+        python prepare_expanded_data.py
+        echo "✓ Data prepared with 40 samples"
+    
+    - name: Train model (1 epoch for CI)
+      run: |
+        python -c "
+        from train import train_model
+        model, metrics = train_model(epochs=1)
+        print(f'Training completed - Final accuracy: {metrics[\"train_accuracies\"][-1]:.2f}%')
+        "
+    
+    - name: Export to ONNX
+      run: |
+        python export_onnx.py
+    
+    - name: Validate models exist
+      run: |
+        ls -la models/
+        test -f models/mnist_cnn.pth || (echo "PyTorch model missing" && exit 1)
+        test -f models/mnist_cnn.onnx || (echo "ONNX model missing" && exit 1)
+        echo "✓ Both PyTorch and ONNX models created successfully"
+    
+    - name: Test model inference
+      run: |
+        python -c "
+        import torch
+        import onnxruntime as ort
+        import numpy as np
+        
+        # Test PyTorch model
+        from model import SimpleCNN
+        model = SimpleCNN()
+        model.load_state_dict(torch.load('models/mnist_cnn.pth', map_location='cpu'))
+        model.eval()
+        
+        test_input = torch.randn(1, 1, 28, 28)
+        with torch.no_grad():
+            pytorch_output = model(test_input)
+        print(f'✓ PyTorch inference: {pytorch_output.shape}')
+        
+        # Test ONNX model
+        ort_session = ort.InferenceSession('models/mnist_cnn.onnx')
+        ort_inputs = {'input': test_input.numpy()}
+        onnx_output = ort_session.run(None, ort_inputs)
+        print(f'✓ ONNX inference: {onnx_output[0].shape}')
+        
+        # Compare outputs
+        diff = np.max(np.abs(pytorch_output.numpy() - onnx_output[0]))
+        assert diff < 1e-5, f'Models differ too much: {diff}'
+        print(f'✓ Model outputs match (diff: {diff:.6f})')
+        "
+    
+    - name: Upload model artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: trained-models
+        path: |
+          models/mnist_cnn.pth
+          models/mnist_cnn.onnx
+        retention-days: 30
+
+  integration-test:
+    runs-on: ubuntu-latest
+    name: Integration Tests
+    needs: train-and-export
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        pip install -r requirements.txt
+    
+    - name: Download model artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: trained-models
+        path: models/
+    
+    - name: Run integration tests
+      run: |
+        python -c "
+        import os
+        import torch
+        import onnxruntime as ort
+        from model import SimpleCNN
+        
+        # Verify both models exist
+        assert os.path.exists('models/mnist_cnn.pth'), 'PyTorch model missing'
+        assert os.path.exists('models/mnist_cnn.onnx'), 'ONNX model missing'
+        print('✓ Both model files found')
+        
+        # Test PyTorch model loading
+        model = SimpleCNN()
+        model.load_state_dict(torch.load('models/mnist_cnn.pth', map_location='cpu'))
+        model.eval()
+        print('✓ PyTorch model loads successfully')
+        
+        # Test ONNX model loading
+        ort_session = ort.InferenceSession('models/mnist_cnn.onnx')
+        print('✓ ONNX model loads successfully')
+        
+        # Test with random batch
+        batch_input = torch.randn(5, 1, 28, 28)
+        
+        with torch.no_grad():
+            pytorch_batch_output = model(batch_input)
+        
+        onnx_batch_output = ort_session.run(None, {'input': batch_input.numpy()})
+        
+        assert pytorch_batch_output.shape == (5, 10), f'Wrong PyTorch shape: {pytorch_batch_output.shape}'
+        assert onnx_batch_output[0].shape == (5, 10), f'Wrong ONNX shape: {onnx_batch_output[0].shape}'
+        print('✓ Batch inference test passed')
+        
+        print('🎉 All integration tests passed!')
+        "
+
+  release:
+    runs-on: ubuntu-latest
+    name: Create Release
+    needs: [test, train-and-export, integration-test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Download model artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: trained-models
+        path: models/
+    
+    - name: Generate release info
+      id: release_info
+      run: |
+        # Generate version based on date and commit
+        VERSION="v$(date +'%Y.%m.%d')-${GITHUB_SHA::7}"
+        echo "version=${VERSION}" >> $GITHUB_OUTPUT
+        
+        # Get model sizes
+        PYTORCH_SIZE=$(du -h models/mnist_cnn.pth | cut -f1)
+        ONNX_SIZE=$(du -h models/mnist_cnn.onnx | cut -f1)
+        
+        # Create release notes
+        cat > release_notes.md << EOF
+        # MNIST SimpleCNN Model Release ${VERSION}
+        
+        ## Models Included
+        - **PyTorch Model**: \`mnist_cnn.pth\` (${PYTORCH_SIZE})
+        - **ONNX Model**: \`mnist_cnn.onnx\` (${ONNX_SIZE})
+        
+        ## Training Details
+        - **Architecture**: SimpleCNN (421K parameters)
+        - **Training Data**: 40 MNIST samples
+        - **Framework**: PyTorch with MLflow tracking
+        - **CI/CD**: Automated testing and deployment
+        
+        ## Usage
+        
+        ### PyTorch
+        \`\`\`python
+        import torch
+        from model import SimpleCNN
+        
+        model = SimpleCNN()
+        model.load_state_dict(torch.load('mnist_cnn.pth'))
+        model.eval()
+        \`\`\`
+        
+        ### ONNX
+        \`\`\`python
+        import onnxruntime as ort
+        
+        session = ort.InferenceSession('mnist_cnn.onnx')
+        output = session.run(None, {'input': input_data})
+        \`\`\`
+        
+        ## Verification
+        All models have been automatically tested in CI/CD pipeline.
+        EOF
+        
+        echo "Generated release notes for ${VERSION}"
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.release_info.outputs.version }}
+        name: "MNIST Model ${{ steps.release_info.outputs.version }}"
+        body_path: release_notes.md
+        files: |
+          models/mnist_cnn.pth
+          models/mnist_cnn.onnx
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
