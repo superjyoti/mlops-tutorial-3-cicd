@@ -7,7 +7,7 @@ import shutil
 from unittest.mock import patch
 
 from model import SimpleCNN
-from export_onnx import export_to_onnx, test_onnx_model
+from export_onnx import export_to_onnx, validate_onnx_model
 
 
 class TestONNXExport:
@@ -116,7 +116,7 @@ class TestONNXExport:
         export_to_onnx(model_path, onnx_path)
         
         # Test batch inference
-        test_onnx_model(onnx_path)  # This should not raise any exceptions
+        validate_onnx_model(onnx_path)  # This should not raise any exceptions
         
         # Additional batch size tests
         import onnxruntime as ort

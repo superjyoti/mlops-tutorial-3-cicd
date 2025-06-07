@@ -123,7 +123,7 @@ def export_to_onnx(model_path='./models/mnist_cnn.pth', output_path='./models/mn
     return export_metadata
 
 
-def test_onnx_model(onnx_path='./models/mnist_cnn.onnx'):
+def validate_onnx_model(onnx_path='./models/mnist_cnn.onnx'):
     """
     Test ONNX model with multiple inputs
     
@@ -167,7 +167,7 @@ if __name__ == "__main__":
         metadata = export_to_onnx()
         
         # Test exported model
-        test_onnx_model()
+        validate_onnx_model()
         
         print("\n🎉 ONNX export completed successfully!")
         print("Ready for production deployment.")
